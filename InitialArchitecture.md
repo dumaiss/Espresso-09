@@ -1,4 +1,4 @@
-# Project: Espresso-09 (uBITz 6309)
+# Project: Espresso-09
 **"A High-Pressure Extraction of the 8-bit Era"**
 
 ## 1. Architecture Overview
