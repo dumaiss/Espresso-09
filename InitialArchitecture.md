@@ -1,8 +1,3 @@
-Here is the consolidated **Espresso-09 Design Document**.
-
-This single Markdown file contains the architecture specifications, the PLD logic, the wiring tables, and the assembly bootloader code we have defined. You can save this as `Espresso09_Design.md` in your project repository to serve as the master reference for the build.
-
-```markdown
 # Project: Espresso-09 (uBITz 6309)
 **"A High-Pressure Extraction of the 8-bit Era"**
 
@@ -244,7 +239,6 @@ SHADOW_ROM:
     LDA     #6              ; Restore Window
     STA     MMU_REGS_SYS+6
     RTS
-
 ```
 
 ```
