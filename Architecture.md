@@ -50,7 +50,7 @@ flowchart LR
     MAP -->|"attributes"| CPLD
     CPLD -->|"RAM/ROM select and strobes"| RAM
     CPLD -->|"ROM overlay and strobes"| ROM
-    CPLD -->|"fixed I/O decode"| IO
+    CPLD -->|"fixed I/O decode + CS3..CS0"| IO
 ```
 
 ## 3. NitrOS-9 Level 2 memory model
@@ -126,27 +126,46 @@ This is useful for:
 
 The `FE00h-FEFFh` range is permanently visible and independent of the current LS612 task.
 
-Its low byte is divided as:
+Within that window, CPU address bits `A7..A4` select one of sixteen pBITz Device Select values **at the Espresso-side CPLD**. The CPLD drives that four-bit value onto the pBITz bus control signals `CS3..CS0`:
 
 ```text
-A7..A4   Device Select 0..15
-A3..A0   card-local register 0..15
-```
+CPU logical address
 
-Conceptually:
-
-```text
-FE D R
+FE D x
    | |
-   | +-- local register
-   +---- pBITz Device Select
+   | +-- A3..A0 remain available for card-local sub-decoding
+   |
+   +---- A7..A4 = D
+              |
+              v
+       Espresso CPLD
+              |
+              v
+        bus CS3..CS0
+              |
+              v
+   compared with each card's
+   4-bit rotary-switch setting
 ```
 
-A card may compare `A7..A4` against its 4-bit rotary-switch setting and then use `A3..A0` for its own sub-decoding. This lets devices such as a VIA, ESCC, latch, FIFO, or other peripheral decode their own internal registers without changing the pBITz bus convention.
+The peripheral cards do **not** determine selection by comparing CPU address bits `A7..A4`. They compare the pBITz control signals `CS3..CS0` against their configured Device Select value.
 
-The fixed window must never depend on LS612 contents or `TASK_SELECT`.
+Once a card is selected, it may use whichever ordinary address lines it needs for its own register decoding. In a sixteen-byte Device Select slot, `A3..A0` provide up to sixteen distinct host addresses; many peripherals need only `A0`, `A1`, or `A2`, while devices with sixteen registers can use `A3..A0`.
 
-The selected host interface for the RX660 I/O Controller is a **W65C22S VIA**. Its sixteen host-visible registers fit naturally into one pBITz Device Select slot. The exact Device Select value is not yet frozen.
+This separation is intentional:
+
+```text
+host address decode        card-local decode
+-------------------        -----------------
+A7..A4 -> CPLD             A0..A3 as needed
+          |
+          v
+       CS3..CS0 ----------> card select comparator
+```
+
+The fixed window and the generated `CS3..CS0` value must never depend on LS612 contents or `TASK_SELECT`.
+
+The selected host interface for the RX660 I/O Controller is a **W65C22S VIA**. Its sixteen host-visible registers fit naturally into one pBITz Device Select slot. The exact Device Select value is not yet frozen; whichever value is chosen will be presented to the VIA card as the corresponding `CS3..CS0` bus value.
 
 ## 6. Physical memory map
 
@@ -425,7 +444,8 @@ Its expected responsibilities are:
 - LS612 pass/map control
 - `TASK_SELECT` generation for LS612 `MA3`
 - LS612 register `CS` and `STROBE`
-- fixed `FE00h` pBITz I/O decode
+- fixed `FE00h-FEFFh` pBITz I/O-window decode
+- conversion of I/O-window `A7..A4` into pBITz bus `CS3..CS0`
 - fixed MMU/control/common/vector overlays
 - RAM/ROM chip selection
 - safe `/OE` and `/WE` qualification
@@ -501,7 +521,7 @@ RX660
     +-- asynchronous events
 ```
 
-The host sees an ordinary peripheral, not another memory subsystem. The VIA occupies one 16-register pBITz Device Select slot in the fixed `FE00h-FEFFh` aperture. The exact Device Select value remains a board-level decision.
+The host sees an ordinary peripheral, not another memory subsystem. The VIA occupies one sixteen-byte pBITz Device Select slot in the fixed `FE00h-FEFFh` aperture. The Espresso CPLD presents that slot's Device Select value on bus `CS3..CS0`; the VIA-side card logic compares `CS3..CS0` with its configured selection, then uses `A3..A0` as required to address the VIA registers. The exact Device Select value remains a board-level decision.
 
 The VIA is a transport endpoint rather than the complete IOC register file. Logical IOC registers and state live in RX660 SRAM. Firmware may therefore expose a substantially larger software-defined register/command space without consuming additional 6309 address space.
 
@@ -573,6 +593,7 @@ Verify:
 - physical block `40h-7Fh` selecting ROM
 - invalid handling for block values `80h-FFh`
 - fixed `FE00h-FEFFh` visibility in both tasks
+- correct `A7..A4` to bus `CS3..CS0` encoding throughout the fixed I/O window
 - fixed MMU/control/common/vector visibility in both tasks
 - mapper-register cycles suppressing memory/MMIO strobes
 - attribute defaults and one-shot override, if implemented
@@ -611,6 +632,7 @@ Verify:
 
 Verify:
 
+- the selected VIA card responds to its configured `CS3..CS0` value rather than decoding `A7..A4` directly
 - all sixteen VIA registers are accessible through the selected fixed pBITz Device Select slot
 - VIA access remains visible in both LS612 tasks
 - host-to-RX660 byte handshaking cannot lose or duplicate bytes
