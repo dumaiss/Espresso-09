@@ -19,7 +19,7 @@ Espresso-09 is currently an architecture and hardware-design project. The reposi
 | Fixed pBITz I/O window | Defined |
 | ROM-to-RAM instant-on boot model | Defined at architectural level |
 | ATF15xx control/decode CPLD | Architecture defined; device/package and equations pending |
-| RX660 I/O Controller | Planned; host transport still being evaluated |
+| W65C22S / RX660 I/O Controller interface | Architecture selected; electrical assignment and byte protocol pending |
 | NitrOS-9 Level 2 port | Target architecture defined; implementation not started |
 | CPU board schematic and PCB | Not started |
 | Emulator support | Future work |
@@ -123,9 +123,18 @@ The Espresso port will still require platform-specific boot, MMU, interrupt, tim
 
 ## I/O Controller
 
-Modern storage and human-interface services are expected to be offloaded to an **RX660-based I/O Controller** shared conceptually with other pBITz machines.
+Modern storage and human-interface services are expected to be offloaded to an **RX660-based I/O Controller**. The selected host-facing interface is a **W65C22S VIA** rather than dual-port shared RAM.
 
-The exact host-facing transport is not yet frozen. A small dual-port RAM interface is currently being considered as an alternative to a VIA-style register interface because it could simplify command/data exchange across multiple coffee-series CPUs.
+The VIA presents an ordinary 16-register peripheral to the 6309 through the fixed pBITz I/O window. It is the electrical and handshake endpoint for IOCALL-style transactions; it is **not** intended to hold the I/O Controller's complete state or buffers.
+
+The richer interface lives in RX660 SRAM. Firmware can expose logical registers, command queues, replies, events, and bulk-transfer buffers through a byte-level protocol carried by the VIA. A typical transaction can therefore use one VIA port as an 8-bit data path, the other for command/index information, and the VIA control lines for host-to-controller and controller-to-host handshaking. The exact port and control-line assignment is not yet frozen.
+
+The same transport is expected to support:
+
+- short host-to-IOC commands and replies
+- software-defined IOC register access
+- bulk byte streams for blocks such as storage sectors
+- asynchronous events and host interrupts
 
 Expected I/O Controller responsibilities include:
 
@@ -133,9 +142,10 @@ Expected I/O Controller responsibilities include:
 - keyboard and controller input
 - real-time clock and system services
 - asynchronous host events
-- possible shared-memory or DMA-like transfers where appropriate
 
-Any bus-master or shared-memory mechanism must use a defined physical-memory interface rather than accidentally inheriting whichever user DAT happens to be active.
+The VIA's timers and shift register remain available, but the final source of the NitrOS-9 system tick and other host timing services is still an implementation decision.
+
+The IOC transport is not intended to grow a parallel shared-memory path. Any future high-bandwidth DMA or shared-memory facility should be designed separately with explicit physical-address semantics rather than becoming part of the RX660 mailbox interface.
 
 ## Video and sound
 
@@ -160,7 +170,8 @@ Schematic, programmable-logic, firmware, and emulator directories will be added 
 
 - Treat [Architecture.md](Architecture.md) as the current architectural reference when older commits disagree.
 - The 8 KiB DAT model and use of LS612 `MA3` as the task selector are intentional architectural choices.
-- Exact CPLD package, pin assignment, memory timing, fixed-common backing, and RX660 shared-memory details still require implementation validation.
+- The W65C22S is the selected host transport for the RX660 I/O Controller; exact VIA/RX660 signaling and the byte-level IOCALL protocol still require definition.
+- Exact CPLD package, pin assignment, memory timing, and fixed-common backing still require implementation validation.
 - Do not infer CoCo/GIME peripheral compatibility from the use of NitrOS-9 Level 2; Espresso-09 is its own pBITz machine.
 
 ## Related repositories
