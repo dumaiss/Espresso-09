@@ -74,16 +74,20 @@ The exact implementation of the common/vector backing store remains part of the 
 
 ### pBITz I/O compatibility
 
-The `FE00h-FEFFh` window preserves the pBITz 4-bit Device Select convention:
+The `FE00h-FEFFh` window preserves the pBITz 4-bit Device Select convention. On an access to this window, the Espresso CPLD uses CPU address bits `A7..A4` to drive the four pBITz bus control signals `CS3..CS0`:
 
 ```text
-FE D R
-   | |
-   | +-- A3..A0: card-local register 0..15
-   +---- A7..A4: Device Select 0..15
+CPU address within FE00h-FEFFh
+
+A7..A4  -------->  Espresso CPLD  -------->  pBITz CS3..CS0
+                                                    |
+                                                    v
+                                      compared with card rotary setting
 ```
 
-This gives each selected expansion device at least sixteen directly addressable registers while keeping I/O permanently visible regardless of the current memory task.
+Peripheral cards select themselves by comparing the bus `CS3..CS0` value with their configured 4-bit Device Select. The address bits themselves are not the card-select interface.
+
+Once selected, a card uses whichever normal address lines it needs for local register decoding—typically `A0`, `A1`, `A2`, and, for a full sixteen-register aperture, `A3`. Thus each Device Select value corresponds to a sixteen-byte logical slot while preserving the normal pBITz card-side decoding convention.
 
 The shared backplane and expansion-bus hardware are maintained in the [pBITzPlatform repository](https://github.com/dumaiss/pBITzPlatform).
 
