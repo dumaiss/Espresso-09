@@ -2,7 +2,7 @@
 
 **A 6309 member of the pBITz coffee-machine family**
 
-Espresso-09 is a modular homebrew computer built around the Hitachi HD63C09E/HD63C09EP. It combines a real 6309 CPU, a 74LS612 memory mapper, 512 KiB of SRAM, 512 KiB of ROM, and the shared pBITz expansion architecture used by the other coffee-series machines.
+Espresso-09 is a modular homebrew computer built around the Hitachi HD63C09E/HD63C09EP. It combines a real 6309 CPU, a 74LS612 memory mapper, **1 MiB of SRAM**, **512 KiB of ROM**, and the shared pBITz expansion architecture used by the other coffee-series machines.
 
 The primary operating-system target is **NitrOS-9 Level 2**. The memory system is deliberately organized around NitrOS-9's native 8 KiB DAT model rather than reproducing the CoCo 3 GIME in programmable logic.
 
@@ -14,11 +14,15 @@ Espresso-09 is currently an architecture and hardware-design project. The reposi
 | --- | --- |
 | HD63C09E/HD63C09EP CPU architecture | Selected |
 | 74LS612-based MMU architecture | Defined at architectural level |
-| 512 KiB RAM + 512 KiB ROM physical map | Defined |
+| 1 MiB RAM + 512 KiB ROM physical map | Defined |
+| 2 MiB physical address envelope | Defined |
 | 8 KiB NitrOS-9-compatible DAT model | Defined |
 | Fixed pBITz I/O window | Defined |
+| Independent `DAT_BANK` / `SYS_MODE` privilege model | Defined at architectural level |
+| BA/BS hardware privilege-entry gate | Defined at architectural level; timing/equations pending |
+| 16-bit unprivileged pBITz permission mask | Defined at architectural level |
 | ROM-to-RAM instant-on boot model | Defined at architectural level |
-| ATF15xx control/decode CPLD | Architecture defined; device/package and equations pending |
+| ATF15xx control/decode CPLD | Architecture defined; device/package, budget, and equations pending |
 | W65C22S / RX660 I/O Controller interface | Architecture selected; electrical assignment and byte protocol pending |
 | NitrOS-9 Level 2 port | Target architecture defined; implementation not started |
 | CPU board schematic and PCB | Not started |
@@ -32,31 +36,47 @@ Espresso-09 is currently an architecture and hardware-design project. The reposi
 - 6309 Native Mode is the normal software target
 - Initial CPU clock target is approximately **3 MHz**; final clock-generation details remain to be finalized
 - 16-bit logical address space and 8-bit data bus
+- CPU `BA`/`BS` bus-state signals are required by the current privilege-entry architecture
 - 6309-specific instructions such as `TFM` are expected to be useful for ROM shadowing and bulk-memory operations
 
 ### Physical memory
 
-Espresso-09 has exactly **1 MiB of physical memory**:
+Espresso-09 uses a **2 MiB physical address envelope** with **1.5 MiB populated**:
 
-| Physical range | Size | Function |
-| --- | ---: | --- |
-| `00000h-7FFFFh` | 512 KiB | SRAM |
-| `80000h-FFFFFh` | 512 KiB | ROM |
+| Physical range | Block range | Size | Function |
+| --- | --- | ---: | --- |
+| `000000h-0FFFFFh` | `00h-7Fh` | 1 MiB | SRAM |
+| `100000h-17FFFFh` | `80h-BFh` | 512 KiB | Reserved / unpopulated |
+| `180000h-1FFFFFh` | `C0h-FFh` | 512 KiB | ROM |
 
-The 20-bit physical address space is divided into 128 blocks of 8 KiB each. Blocks `00h-3Fh` select RAM and blocks `40h-7Fh` select ROM.
+The physical address space is divided into 256 blocks of 8 KiB each. Normal NitrOS-9 RAM allocation therefore has a clean contiguous pool of 128 blocks, `00h-7Fh`, while firmware occupies the top 64 blocks, `C0h-FFh`.
 
-### Memory mapper
+The reserved `80h-BFh` region is intentionally left outside the initial RAM and ROM population. It may remain unused or support a future hardware revision without changing the DAT block format.
 
-The **74LS612** is used as the actual address-translation store and mapper. Its sixteen mapping registers are divided into two complete 64 KiB hardware maps:
+### Memory mapper and privilege state
 
-- entries 0-7: **task 0**, the system/kernel map
-- entries 8-15: **task 1**, the currently active user-process map
+The **74LS612** is used as the actual address-translation store and mapper. Its sixteen mapping registers are divided into two complete 64 KiB hardware DAT banks:
 
-CPU `A15..A13` select one of eight 8 KiB logical blocks. The LS612 `MA3` input is the hardware task-select bit. This is intentionally close to the NitrOS-9 Level 2 DAT model: the CPLD controls policy and fixed overlays, but it does not re-create a second MMU or a GIME-style translation engine.
+- entries 0-7: **hardware DAT bank 0**, the resident system map
+- entries 8-15: **hardware DAT bank 1**, the working map used for the currently required NitrOS-9 software task
 
-With 128 physical 8 KiB blocks, each mapper entry needs seven physical-block bits. The remaining five bits in the LS612's 12-bit entry are available for Espresso-specific attributes such as write protection, invalid-page detection, and future diagnostics.
+CPU `A15..A13` select one of eight 8 KiB logical blocks. The LS612 `MA3` input is driven by the CPLD's `DAT_BANK` state. NitrOS-9 software task numbers remain a separate concept: their eight-byte DAT images live in kernel RAM and are copied into the working hardware bank when required.
 
-See [Architecture.md](Architecture.md) for the current memory architecture and boot sequence.
+Privilege is also separate from DAT-bank selection. The CPLD holds a one-bit `SYS_MODE` latch:
+
+```text
+DAT_BANK=0, SYS_MODE=1   normal kernel/system execution
+DAT_BANK=1, SYS_MODE=1   privileged working-map execution
+DAT_BANK=1, SYS_MODE=0   ordinary unprivileged process execution
+```
+
+The `DAT_BANK=0, SYS_MODE=0` combination is forbidden.
+
+On the CPU's interrupt/reset acknowledge bus state, the CPLD latches `DAT_BANK=0, SYS_MODE=1`. Interrupt and software-interrupt vectors come from the fixed vector overlay and enter fixed trampoline code, so unprivileged software never has to be allowed to write the task/privilege control register in order to enter the kernel.
+
+With a 2 MiB physical envelope, each physical block number is exactly eight bits. Eight of the LS612's twelve stored bits therefore form the physical block number, leaving four bits for Espresso-specific attributes such as write protection, system-only mappings, invalid-page detection, and one future use.
+
+See [Architecture.md](Architecture.md) for the current memory, privilege-entry, and boot architecture.
 
 ## Logical address space
 
@@ -65,12 +85,12 @@ The current architectural baseline keeps almost the entire 64 KiB CPU address sp
 | Logical range | Function |
 | --- | --- |
 | `0000h-FDFFh` | DAT-translated memory |
-| `FE00h-FEFFh` | Fixed pBITz I/O window |
+| `FE00h-FEFFh` | Fixed pBITz I/O aperture |
 | `FF00h-FF1Fh` | Fixed MMU/control registers |
-| `FF20h-FFEFh` | Fixed common RAM / task-switch trampoline area |
+| `FF20h-FFEFh` | Fixed common RAM / DAT-bank and privilege trampoline area |
 | `FFF0h-FFFFh` | Fixed vector window |
 
-The exact implementation of the common/vector backing store remains part of the hardware design, but these windows are intentionally independent of the currently selected DAT task.
+The exact implementation of the common/vector backing store remains part of the hardware design, but these windows are intentionally independent of the currently selected DAT bank.
 
 ### pBITz I/O compatibility
 
@@ -87,7 +107,9 @@ A7..A4  -------->  Espresso CPLD  -------->  pBITz CS3..CS0
 
 Peripheral cards select themselves by comparing the bus `CS3..CS0` value with their configured 4-bit Device Select. The address bits themselves are not the card-select interface.
 
-Once selected, a card uses whichever normal address lines it needs for local register decoding—typically `A0`, `A1`, `A2`, and, for a full sixteen-register aperture, `A3`. Thus each Device Select value corresponds to a sixteen-byte logical slot while preserving the normal pBITz card-side decoding convention.
+Once selected, a card uses whichever normal address lines it needs for local register decoding—typically `A0`, `A1`, `A2`, and, for a full sixteen-register aperture, `A3`.
+
+Privileged execution (`SYS_MODE=1`) always has pBITz access. Unprivileged access (`SYS_MODE=0`) is controlled by a **16-bit `USER_IO_MASK`**, one permission bit per Device Select. The reset/default NitrOS-9 policy is `0000h`, forcing ordinary user processes through operating-system drivers unless the kernel deliberately grants direct access to a device.
 
 The shared backplane and expansion-bus hardware are maintained in the [pBITzPlatform repository](https://github.com/dumaiss/pBITzPlatform).
 
@@ -95,19 +117,24 @@ The shared backplane and expansion-bus hardware are maintained in the [pBITzPlat
 
 Espresso-09 is intended to provide an **instant-on NitrOS-9** experience from ROM while executing normal runtime code from RAM.
 
-At reset, the LS612 enters pass mode so the first 64 KiB of RAM is available with a known identity mapping. The CPLD overlays a boot ROM region at the top of the logical address space so the 6309 can fetch its reset vector and execute the bootstrap without relying on uninitialized mapper contents.
+At reset, the LS612 enters pass mode so the first 64 KiB of RAM is available with a known identity mapping. The CPLD starts in `DAT_BANK=0, SYS_MODE=1` and overlays a boot ROM region at the top of the logical address space so the 6309 can fetch its reset vector and execute the bootstrap without relying on uninitialized mapper contents.
+
+The final ROM block is physical block `FFh`, so the reset vectors can live naturally at physical addresses `1FFFFEh-1FFFFFh` and be overlaid into logical `FFFEh-FFFFh` during boot.
 
 The normal startup sequence is expected to:
 
-1. reset into LS612 pass mode with task 0 selected
+1. reset into LS612 pass mode with `DAT_BANK=0, SYS_MODE=1`
 2. execute the bootstrap from the ROM overlay
-3. initialize the system and user DAT entries
-4. enter LS612 map mode while keeping the boot ROM overlay active
-5. copy the ROM image into RAM in 8 KiB blocks using temporary source/destination windows and `TFM`
-6. install the runtime NitrOS-9 system map and fixed common/vector state
-7. transfer execution to a RAM-resident handoff stub
-8. disable the boot ROM overlay
-9. continue into NitrOS-9 from RAM
+3. initialize hardware DAT bank 0 and hardware DAT bank 1
+4. initialize unprivileged I/O permissions
+5. enter LS612 map mode while keeping the boot ROM overlay active
+6. copy the ROM image into RAM in 8 KiB blocks using temporary source/destination windows and `TFM`
+7. install the runtime NitrOS-9 system map and fixed common/vector state
+8. transfer execution to a RAM-resident handoff stub
+9. disable the boot ROM overlay
+10. continue into NitrOS-9 from RAM
+
+A full 512 KiB shadow maps ROM blocks `C0h-FFh` to RAM blocks `00h-3Fh`, leaving RAM blocks `40h-7Fh`—the upper 512 KiB—untouched and immediately available. Runtime code may later reuse any shadowed block that does not contain live system/module data.
 
 Normal runtime mappings are expected to use RAM. ROM remains the reset/firmware source and may still be explicitly mapped for diagnostics or recovery if the final CPLD policy permits it.
 
@@ -118,10 +145,16 @@ NitrOS-9 Level 2 is the primary operating-system target.
 The hardware is designed around its native memory-management model:
 
 - eight 8 KiB DAT blocks per 64 KiB process address space
-- a permanent system hardware map
-- one hardware map for the currently running user process
-- additional process DAT images maintained by the kernel in software
-- context switches implemented by loading eight physical-block bytes into LS612 task-1 entries
+- a permanent system hardware DAT bank
+- one working hardware DAT bank
+- NitrOS-9 software task numbers `0..31`, each represented by an eight-byte DAT image in kernel memory
+- context switches implemented by loading the selected software task's eight physical-block bytes into LS612 hardware DAT bank 1 when required
+- cached working-bank reuse when the same unchanged DAT image remains resident
+- 128 physical RAM blocks (`00h-7Fh`) available to the Espresso NitrOS-9 port
+
+The **1 MiB RAM target** is intended to provide comfortable headroom for an EOU-style NitrOS-9 environment, multiple resident processes, graphics/window services, modules, buffers, and development tools without changing the native 8 KiB DAT model.
+
+The Espresso port deliberately adds a real privilege boundary that stock CoCo 3 NitrOS-9 does not have. User→kernel entry therefore relies on the hardware `BA`/`BS` acknowledge gate, while kernel return to user execution is explicit from the fixed privileged trampoline.
 
 The Espresso port will still require platform-specific boot, MMU, interrupt, timer, console, storage, and device drivers, but the goal is to preserve the existing NitrOS-9 Level 2 memory-management concepts rather than emulate CoCo-specific peripherals.
 
@@ -173,9 +206,15 @@ Schematic, programmable-logic, firmware, and emulator directories will be added 
 ## Development notes
 
 - Treat [Architecture.md](Architecture.md) as the current architectural reference when older commits disagree.
-- The 8 KiB DAT model and use of LS612 `MA3` as the task selector are intentional architectural choices.
+- The **1 MiB RAM + 512 KiB ROM / 2 MiB physical envelope** is the current target memory configuration.
+- The two LS612 halves are **hardware DAT banks**, not NitrOS-9 software task numbers.
+- `DAT_BANK` selects LS612 `MA3`; `SYS_MODE` is the independent hardware privilege state.
+- The `BA`/`BS` interrupt/reset acknowledge state provides the one-way hardware entry from unprivileged execution to `DAT_BANK=0, SYS_MODE=1`.
+- The 16-bit `USER_IO_MASK` controls pBITz permissions only while `SYS_MODE=0`; privileged execution bypasses it regardless of DAT bank.
+- Non-default `MMU_ATTR` programming is a two-write critical sequence: IRQ/FIRQ must be masked, and every mapper-entry write clears the attribute staging-valid state.
 - The W65C22S is the selected host transport for the RX660 I/O Controller; exact VIA/RX660 signaling and the byte-level IOCALL protocol still require definition.
-- Exact CPLD package, pin assignment, memory timing, and fixed-common backing still require implementation validation.
+- **CPLD macrocell/product-term/pin budgeting is now a near-term design task** before the final ATF15xx device/package is selected.
+- Exact CPLD package, pin assignment, memory timing, privilege-entry timing, and fixed-common backing still require implementation validation.
 - Do not infer CoCo/GIME peripheral compatibility from the use of NitrOS-9 Level 2; Espresso-09 is its own pBITz machine.
 
 ## Related repositories
