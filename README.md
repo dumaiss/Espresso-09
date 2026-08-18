@@ -145,6 +145,8 @@ Expected I/O Controller responsibilities include:
 
 The VIA's timers and shift register remain available, but the final source of the NitrOS-9 system tick and other host timing services is still an implementation decision.
 
+The IOC transport is not intended to grow a parallel shared-memory path. Any future high-bandwidth DMA or shared-memory facility should be designed separately with explicit physical-address semantics rather than becoming part of the RX660 mailbox interface.
+
 ## Video and sound
 
 Video and sound are expansion functions rather than fixed properties of the CPU board. Espresso-09 is intended to reuse compatible pBITz and Percolator-series hardware where practical.
