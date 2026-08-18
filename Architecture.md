@@ -557,6 +557,8 @@ The VIA provides the host-visible interrupt and handshake mechanism for IOC even
 
 The VIA's timers and shift register are available to Espresso-09, but they do not have to be used merely because the device provides them. The final source of the NitrOS-9 system tick and other host timing services remains an implementation decision; it may use a VIA timer, an RX660-generated event, or another system timer if one is later added.
 
+The design is **not** intended to grow a second shared-memory path to the RX660 alongside the VIA. If a future high-bandwidth subsystem genuinely needs shared memory or DMA, it should be designed as a separate facility with explicit physical-address semantics rather than being folded into the IOC transport.
+
 ## 19. Verification plan
 
 ### 19.1 Mapper and CPLD simulation
