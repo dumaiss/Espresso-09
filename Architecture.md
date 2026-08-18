@@ -21,6 +21,7 @@ The current architectural goals are:
 - hardware boot and interrupt vectors that are always reachable
 - an instant-on NitrOS-9 image in ROM, followed by normal execution from RAM
 - a memory-management design that fits NitrOS-9 Level 2 instead of reproducing a CoCo 3 GIME in a CPLD
+- a conventional peripheral boundary between the host CPU and RX660 I/O Controller rather than a shared-memory transport
 
 ## 2. Architectural overview
 
@@ -144,6 +145,8 @@ FE D R
 A card may compare `A7..A4` against its 4-bit rotary-switch setting and then use `A3..A0` for its own sub-decoding. This lets devices such as a VIA, ESCC, latch, FIFO, or other peripheral decode their own internal registers without changing the pBITz bus convention.
 
 The fixed window must never depend on LS612 contents or `TASK_SELECT`.
+
+The selected host interface for the RX660 I/O Controller is a **W65C22S VIA**. Its sixteen host-visible registers fit naturally into one pBITz Device Select slot. The exact Device Select value is not yet frozen.
 
 ## 6. Physical memory map
 
@@ -476,22 +479,83 @@ The hardware design should therefore verify:
 
 A 74HCT612-compatible part may be attractive if a trustworthy source is found, but obsolete/NOS provenance, electrical limits, and timing must be validated against the actual device used.
 
-## 18. RX660 I/O Controller and shared memory
+## 18. W65C22S / RX660 I/O Controller
 
-Espresso-09 is expected to use an RX660-based I/O Controller for modern peripheral services.
+Espresso-09 uses an **RX660-based I/O Controller** for modern peripheral services. The selected host-facing transport is a **W65C22S VIA** rather than dual-port RAM.
 
-The host interface is not yet frozen. A small dual-port RAM is currently a strong candidate because it can decouple host timing from the MCU and may generalize well across Espresso-09, Ristretto/Nitro, and other pBITz machines.
+The architectural boundary is intentionally conventional:
 
-If the RX660 later becomes a bus master or gains direct shared-memory access, it must not accidentally inherit the currently selected user DAT.
+```text
+6309 host bus
+    |
+    v
+W65C22S VIA
+    |
+    | 8-bit parallel data/control + handshake
+    v
+RX660
+    |
+    +-- software register file
+    +-- command/reply queues
+    +-- transfer buffers
+    +-- asynchronous events
+```
 
-Acceptable models include:
+The host sees an ordinary peripheral, not another memory subsystem. The VIA occupies one 16-register pBITz Device Select slot in the fixed `FE00h-FEFFh` aperture. The exact Device Select value remains a board-level decision.
 
-- direct physical addressing
-- a fixed common physical buffer
-- a dedicated translation context
-- a dual-port memory mailbox that avoids host-bus mastering entirely
+The VIA is a transport endpoint rather than the complete IOC register file. Logical IOC registers and state live in RX660 SRAM. Firmware may therefore expose a substantially larger software-defined register/command space without consuming additional 6309 address space.
 
-This decision should be completed before committing DMA-capable hardware.
+A likely electrical model uses:
+
+- one VIA 8-bit port as the bidirectional byte data path
+- the second 8-bit port for command, register index, or transaction control
+- VIA control lines for host-to-RX660 strobe/acknowledge and RX660-to-host ready/event signaling
+
+The exact PA/PB and CA/CB assignment is intentionally not frozen yet. It should be selected after reviewing the VIA handshake modes and RX660 GPIO/interrupt placement.
+
+### 18.1 IOCALL transport model
+
+The byte-level protocol should support four basic operations:
+
+- host-to-IOC command submission
+- IOC-to-host replies
+- asynchronous IOC events with host interrupt notification
+- bulk byte-stream transfers
+
+A logical register access can be represented as an indexed transaction, for example:
+
+```text
+WRITE IOC register 12h = FAh
+
+host -> VIA: index 12h
+host -> VIA: data FAh
+host -> VIA: strobe
+RX660:      ioc_register[12h] = FAh
+```
+
+These logical registers are software constructs in RX660 memory, not physical VIA registers.
+
+Bulk transfers use the same byte path. For example, a storage read can prepare a sector in RX660 SRAM and stream it through the VIA after a command/reply exchange. This avoids a CPU-visible shared-memory buffer and avoids SRAM arbitration while still allowing the RX660 to absorb data into its much larger local memory.
+
+The intended software abstraction is therefore:
+
+```text
+IOCALL ABI
+    |
+    v
+W65C22S transport
+    |
+    v
+RX660 command/register/buffer model
+```
+
+This also leaves room for other coffee-series machines to use the same IOCALL command ABI even if their electrical transport differs.
+
+### 18.2 Interrupts and timers
+
+The VIA provides the host-visible interrupt and handshake mechanism for IOC events. The exact event encoding and interrupt service protocol remain to be defined.
+
+The VIA's timers and shift register are available to Espresso-09, but they do not have to be used merely because the device provides them. The final source of the NitrOS-9 system tick and other host timing services remains an implementation decision; it may use a VIA timer, an RX660-generated event, or another system timer if one is later added.
 
 ## 19. Verification plan
 
@@ -541,7 +605,20 @@ Verify:
 - correct physical-memory sizing to 64 RAM blocks
 - user attempts to modify privileged MMU registers are rejected
 
-### 19.4 Hardware timing validation
+### 19.4 I/O Controller validation
+
+Verify:
+
+- all sixteen VIA registers are accessible through the selected fixed pBITz Device Select slot
+- VIA access remains visible in both LS612 tasks
+- host-to-RX660 byte handshaking cannot lose or duplicate bytes
+- RX660-to-host replies cannot race host reads
+- asynchronous events reliably assert and clear the host interrupt
+- command/reply transactions recover cleanly from reset or partial transfers
+- bulk transfers can stream blocks without requiring shared host memory
+- IOC protocol state remains entirely RX660-owned except for the VIA transport state
+
+### 19.5 Hardware timing validation
 
 Measure:
 
@@ -552,6 +629,8 @@ Measure:
 - mapper `STROBE` setup/hold and pulse width
 - RAM/ROM data validity at CPU sampling
 - task-switch timing through the common trampoline
+- W65C22S bus timing relative to the selected 6309 `E` clock
+- VIA/RX660 handshake latency and setup/hold margins
 - 5 V rail droop and mapper temperature
 - behavior during CPLD JTAG programming
 
@@ -567,17 +646,19 @@ The following details are intentionally not yet frozen:
 - exact RAM and ROM devices
 - LS612 versus a validated compatible HCT mapper
 - final 6309 clock and complete timing proof
-- RX660 host transport: dual-port RAM versus another interface
-- RX660 shared-memory/DMA policy
-- timer implementation if the host interface no longer provides VIA-style timers
+- W65C22S Device Select assignment
+- exact VIA PA/PB and CA/CB assignment to the RX660
+- byte-level IOCALL command/reply/event/bulk-transfer protocol
+- final timer source for the NitrOS-9 system tick
 
-These items should be resolved by schematic and firmware bring-up without changing the central architectural decision: **two native 8 KiB LS612 maps selected by `MA3`, with a small fixed top-of-memory system area.**
+These items should be resolved by schematic and firmware bring-up without changing the central architectural decisions: **two native 8 KiB LS612 maps selected by `MA3`, a small fixed top-of-memory system area, and a W65C22S peripheral transport to the RX660 I/O Controller.**
 
 ## 21. References
 
 - Texas Instruments, **SN54LS610 through SN54LS613 / SN74LS610 through SN74LS613 Memory Mappers**:  
   <https://media.digikey.com/pdf/Data%20Sheets/Rochester%20PDFs/SN54LSS61x_SN74LS61x.pdf>
 - Hitachi, **HD6309/HD63C09 Hardware Data Sheet**
+- Western Design Center, **W65C22S Versatile Interface Adapter**
 - Microchip, **ATF1502AS/ATF1502ASL 5V CPLD Data Sheet**
 - Microchip, **ATF1504AS 5V CPLD Data Sheet**
 - [NitrOS-9 source tree](https://github.com/nitros9project/nitros9)
