@@ -26,28 +26,36 @@ The current architectural goals are:
 - an instant-on NitrOS-9 image in ROM, followed by normal execution from RAM
 - a memory-management design that fits NitrOS-9 Level 2 instead of reproducing a CoCo 3 GIME in a CPLD
 - a conventional peripheral boundary between the host CPU and RX660 I/O Controller rather than a shared-memory transport
+- deliberate external predecode and discrete CPU-clock logic where they materially reduce CPLD pin or logic pressure
+- software-owned configuration state, with hardware readback reserved for state that hardware can create asynchronously
 
 ## 2. Architectural overview
 
-The memory subsystem is divided between two devices with deliberately different jobs:
+The memory subsystem is divided between several devices with deliberately different jobs:
 
 - the **74LS612** stores the actual translation entries and performs DAT translation
-- an **ATF15xx CPLD** implements decode, DAT-bank selection, privilege state, interrupt/reset entry gating, boot/fixed overlays, mapper-register access, pBITz Device Select generation and permission gating, transfer qualification, and optional protection/fault policy
+- simple **external combinational predecode** identifies the fixed `FEh` and `FFh` logical pages
+- an **ATF15xx CPLD** implements DAT-bank selection, privilege state, interrupt/reset entry gating, boot/fixed overlays, mapper-register access, pBITz Device Select generation and permission gating, transfer qualification, and optional protection/fault policy
+- discrete clock/cycle-extension logic generates the CPU clocks and MRDY behavior; the CPLD may observe CPU timing but is not the primary clock generator
 
 The CPLD is not a second MMU. Espresso-09 uses the LS612 `MA3` input as the hardware DAT-bank selector and keeps privilege as separate CPLD state.
 
 ```mermaid
 flowchart LR
     CPU["HD63C09E/EP<br/>A15..A0, D7..D0<br/>E, Q, R/W, BA, BS"]
+    PRE["external predecode<br/>FE_PAGE / FF_PAGE"]
     MAP["74LS612<br/>16 x 12-bit map RAM"]
-    CPLD["ATF15xx<br/>decode, overlays,<br/>DAT_BANK, SYS_MODE,<br/>I/O permissions<br/>and bus policy"]
+    CPLD["ATF15xx<br/>overlays, DAT_BANK,<br/>SYS_MODE, I/O permissions<br/>and bus policy"]
     RAM["1 MiB SRAM"]
     ROM["512 KiB ROM"]
     IO["pBITz I/O"]
 
+    CPU -->|"A15..A8"| PRE
+    PRE -->|"FE_PAGE, FF_PAGE"| CPLD
     CPU -->|"A15..A13"| MAP
     CPLD -->|"DAT_BANK -> MA3"| MAP
     CPU -->|"BA, BS"| CPLD
+    CPU -->|"A7..A0, D7..D0"| CPLD
     CPU -->|"A12..A0"| RAM
     CPU -->|"A12..A0"| ROM
     MAP -->|"physical block"| RAM
@@ -192,11 +200,26 @@ This is useful for:
 - avoiding an I/O hole in the middle of normal RAM
 - executing the privilege-entry/return trampoline while `DAT_BANK` changes
 
+### 4.2 External `FEh` / `FFh` page predecode
+
+The fixed locations of the pBITz and MMU/common/vector windows are intentional enough that Espresso does not need to spend CPLD pins preserving arbitrary relocation of those pages.
+
+Simple external combinational logic therefore predecodes the CPU high address byte into two qualifiers:
+
+```text
+FE_PAGE = 1 when CPU A15..A8 = FEh
+FF_PAGE = 1 when CPU A15..A8 = FFh
+```
+
+The CPLD receives `FE_PAGE`, `FF_PAGE`, and CPU `A7..A0` rather than receiving `A15..A8` solely to rediscover those two fixed pages internally. CPU `A15..A13` still connect directly to the LS612 as mapper-address inputs and are unaffected by this choice.
+
+Using two page qualifiers in place of eight high-address inputs saves **six general-purpose CPLD pins**. The tradeoff is deliberate: moving the fixed I/O/control pages would require changing the external predecode hardware rather than only changing CPLD equations. For Espresso, that loss of flexibility is considered a small price for lower CPLD pin pressure and simpler decode equations.
+
+Optional diagnostics must not force those high address bits back into the CPLD merely to report a logical block number. If detailed memory-fault address capture later proves valuable, its implementation should be budgeted explicitly rather than assumed to be free.
+
 ## 5. pBITz I/O window
 
-The `FE00h-FEFFh` range is permanently decoded at a fixed logical address and is independent of the current LS612 map.
-
-Within that window, CPU address bits `A7..A4` select one of sixteen pBITz Device Select values **at the Espresso-side CPLD**. The CPLD drives that four-bit value onto the pBITz bus control signals `CS3..CS0`:
+The `FE00h-FEFFh` range is permanently decoded at a fixed logical address and is independent of the current LS612 map. `FE_PAGE` supplies the high-page qualification; CPU `A7..A4` then select one of sixteen pBITz Device Select values **at the Espresso-side CPLD**. The CPLD drives that four-bit value onto the pBITz bus control signals `CS3..CS0`:
 
 ```text
 CPU logical address
@@ -455,22 +478,22 @@ Normal NitrOS-9 DAT-image loads use default attributes and do not need this two-
 
 ## 9. Fixed MMU/control interface
 
-The proposed fixed control block is `FF00h-FF1Fh`.
+The proposed fixed control block is `FF00h-FF1Fh`, qualified by external `FF_PAGE` predecode.
 
 A practical register layout is:
 
-| Offset | Function |
-| ---: | --- |
-| `00h-07h` | hardware DAT bank-0 LS612 entries |
-| `08h-0Fh` | hardware DAT bank-1 LS612 entries |
-| `10h` | `MMU_ATTR` staging register |
-| `11h` | `MMU_CTRL` / `DAT_BANK`, `SYS_MODE`, and boot controls |
-| `12h` | fault/status, including memory and I/O protection causes |
-| `13h` | fault detail: logical block or Device Select, `DAT_BANK`, `SYS_MODE`, direction as applicable |
-| `14h` | attribute readback |
-| `15h` | `USER_IO_MASK_LO` — permissions for Device Selects 0-7 |
-| `16h` | `USER_IO_MASK_HI` — permissions for Device Selects 8-15 |
-| `17h-1Fh` | reserved |
+| Offset | Function | Direction |
+| ---: | --- | --- |
+| `00h-07h` | hardware DAT bank-0 LS612 entries | write |
+| `08h-0Fh` | hardware DAT bank-1 LS612 entries | write |
+| `10h` | `MMU_ATTR` staging register | write |
+| `11h` | `MMU_CTRL` / `DAT_BANK`, `SYS_MODE`, and boot controls | write |
+| `12h` | optional hardware fault/status | read |
+| `13h` | optional hardware fault detail | read |
+| `14h` | reserved | — |
+| `15h` | `USER_IO_MASK_LO` — permissions for Device Selects 0-7 | write |
+| `16h` | `USER_IO_MASK_HI` — permissions for Device Selects 8-15 | write |
+| `17h-1Fh` | reserved | — |
 
 The LS612 register-select inputs can be wired directly from CPU `A0..A3` for the sixteen mapper entries.
 
@@ -496,6 +519,26 @@ DAT_BANK=1, SYS_MODE=0
 The exact `MMU_CTRL` bit/command encoding is not frozen, but the architecture requires that this return transition cannot be initiated while `SYS_MODE=0` and that the forbidden `DAT_BANK=0, SYS_MODE=0` state cannot be created.
 
 The `USER_IO_MASK` power-on/reset value is `0000h`. Privileged execution is not subject to the mask.
+
+### 9.1 Write-only configuration and software shadows
+
+CPLD and mapper configuration state is **software-owned**. The baseline architecture does not provide hardware readback merely so software can rediscover values that the kernel itself wrote.
+
+The NitrOS-9 port keeps authoritative shadows in system/fixed RAM for configuration such as:
+
+- the eight-byte DAT images already maintained for NitrOS-9 software tasks
+- any Espresso-specific mapper attributes associated with those mappings
+- `USER_IO_MASK`
+- requested `MMU_CTRL` / boot-overlay state
+- the execution state that must be restored after an interrupt
+
+`MMU_ATTR` is transient write-only staging state and does not require readback. Likewise, reading LS612 entries back is unnecessary because NitrOS-9's RAM-resident DAT images are already the canonical copies.
+
+`DAT_BANK` and `SYS_MODE` also do not require ordinary control-register readback. Interrupt/reset acknowledge may change them in hardware before kernel code executes, so readback after entry could not reconstruct the pre-interrupt state anyway. Fixed/common software must therefore shadow the intended execution state needed for restoration, including the distinction between privileged system-map, privileged working-map, and unprivileged working-map execution.
+
+Only state that can be **created or changed asynchronously by hardware** needs a read path. Optional `FAULT_STATUS`, `FAULT_DETAIL`, or future bus/error status are examples. If those diagnostics are not implemented, the baseline CPLD need not drive the CPU data bus at all; `D7..D0` may remain input-only to the CPLD for configuration writes.
+
+This write-oriented interface is intentional. It avoids an otherwise unnecessary multi-source CPU-data read mux, output-enable equations, and product-term/macrocell consumption.
 
 ## 10. Reset and boot mapping
 
@@ -720,9 +763,10 @@ On a denied memory access the CPLD should:
 
 - suppress RAM and ROM transfer strobes
 - never assert memory write-enable
-- latch `DAT_BANK`, `SYS_MODE`, and logical block
-- latch read/write and protection cause
+- latch protection cause and execution state if optional fault diagnostics are implemented
 - optionally assert `FIRQ`
+
+Because the high logical address byte is predecoded externally rather than routed wholesale into the CPLD, detailed logical-block capture is not a baseline fault feature.
 
 ### 14.2 pBITz device protection
 
@@ -754,9 +798,9 @@ SYS_MODE             -> privilege decision for both
 
 The 6309 has no restartable bus-fault mechanism. Both mechanisms are therefore useful for containment, privilege enforcement, and diagnostics, not demand paging or transparent instruction restart.
 
-## 15. CPLD responsibilities
+## 15. CPLD responsibilities and boundaries
 
-The ATF15xx should remain a control/decode device rather than becoming the memory mapper itself.
+The ATF15xx should remain a control/decode device rather than becoming the memory mapper or CPU clock generator.
 
 Its expected responsibilities are:
 
@@ -769,8 +813,8 @@ Its expected responsibilities are:
 - enforcement that `DAT_BANK=0, SYS_MODE=0` cannot be created
 - LS612 register `CS` and `STROBE`
 - decode of the eight-bit physical block class into RAM, reserved, or ROM space
-- fixed `FE00h-FEFFh` pBITz I/O-window decode
-- conversion of I/O-window `A7..A4` into pBITz bus `CS3..CS0`
+- consumption of external `FE_PAGE` / `FF_PAGE` qualifiers and low-address subdecode
+- conversion of `FE_PAGE` plus `A7..A4` into pBITz bus `CS3..CS0`
 - storage of the sixteen-bit `USER_IO_MASK`
 - privileged bypass and unprivileged Device Select permission lookup
 - suppression of denied pBITz transfer strobes/qualification
@@ -778,12 +822,22 @@ Its expected responsibilities are:
 - fixed MMU/control/common/vector overlays
 - RAM/ROM chip selection
 - safe `/OE` and `/WE` qualification
-- mapper attribute staging/readback if implemented
+- mapper attribute staging if implemented
 - retained `ATTR_LATCH` and `ATTR_VALID` state if attribute staging is implemented
 - unconditional `ATTR_VALID` clear on every mapper-entry write
-- memory-protection fault capture if implemented
+- optional hardware-generated fault/status capture
 - blocking all unprivileged writes to MMU/control/permission state
 - JTAG-safe defaults
+
+The following are deliberately **outside** the CPLD baseline:
+
+- full `A15..A8` fixed-window decode; external logic supplies `FE_PAGE` and `FF_PAGE`
+- primary E/Q clock generation
+- MRDY / basic cycle-extension clocking logic, which can be implemented with a small number of discrete flip-flops/gates
+- general configuration-register readback
+- detailed logical fault-address capture unless later justified by a dedicated budget
+
+Keeping clock generation outside the CPLD avoids coupling basic CPU operation to CPLD fitting and preserves a simple, independently testable clock/MRDY subsystem. Programmable CPU frequency is not currently an architectural requirement; if a future design wants it, that capability should be justified and budgeted explicitly rather than assumed as a reason to move the clock into the CPLD.
 
 The retained-state budget is now a first-class implementation concern. At minimum, the currently selected architecture already implies retained CPLD state for:
 
@@ -810,7 +864,9 @@ This remains a **preliminary budget**, not a timing proof.
 The final analysis must include:
 
 - HD63C09E address-valid and data setup/hold timing
-- `E`/`Q` phase relationships
+- discrete E/Q clock generation and MRDY/cycle-extension timing
+- `E`/`Q` phase relationships as observed by the CPLD where needed for transfer qualification
+- external `FE_PAGE` / `FF_PAGE` predecode propagation delay
 - HD63C09E `BA`/`BS` timing and exact Interrupt/Reset Acknowledge behavior
 - acknowledge detection to registered `DAT_BANK=0, SYS_MODE=1` timing
 - persistence of the privilege-entry state after acknowledge ends
@@ -841,6 +897,7 @@ The original SN74LS612 is a TTL device with significant supply current. Memory a
 The hardware design should therefore verify:
 
 - TTL-compatible input thresholds on SRAM, ROM, and CPLD
+- TTL-compatible thresholds and clean timing for the external `FE_PAGE` / `FF_PAGE` predecode
 - any required HCT buffering
 - loading and signal integrity on `PA13..PA20`
 - routing of CPU `BA` and `BS` to the CPLD
@@ -945,6 +1002,8 @@ Verify:
 - `MO11` / `PA20` remains low in reset pass mode
 - reset produces `DAT_BANK=0, SYS_MODE=1`
 - the forbidden `DAT_BANK=0, SYS_MODE=0` state cannot be created
+- external predecode asserts `FE_PAGE` only for `FE00h-FEFFh` and `FF_PAGE` only for `FF00h-FFFFh`
+- the CPLD fixed-window logic depends on `FE_PAGE` / `FF_PAGE` plus `A7..A0`, not raw `A15..A8`
 - all eight hardware DAT bank-0 entries
 - all eight hardware DAT bank-1 entries
 - `MA3` hardware DAT-bank switching without changing the 8 KiB offset
@@ -979,6 +1038,8 @@ Verify:
 - every mapper-entry write clears `ATTR_VALID` unconditionally
 - an NMI handler cannot consume staged attributes because it performs no mapper writes
 - write-protected/system-only/invalid entries behave according to `SYS_MODE`, if implemented
+- baseline configuration registers require no CPLD data-bus output/readback path
+- optional readable hardware status, if implemented, does not make ordinary configuration state readable by default
 - reset/JTAG-safe write inhibition
 
 ### 19.2 Boot validation
@@ -1027,6 +1088,8 @@ Verify:
 - explicitly granted Device Selects are accessible in `SYS_MODE=0` without granting neighboring devices
 - optional per-process save/restore of `USER_IO_MASK` works if that policy is implemented
 - non-default `MMU_ATTR` programming is done with IRQ/FIRQ masked and NMI handlers do not program mapper entries
+- software shadows are authoritative for DAT mappings, mapper attributes, I/O permissions, and intended execution state
+- interrupt restoration uses fixed/common software state rather than relying on post-entry `DAT_BANK`/`SYS_MODE` readback
 
 ### 19.4 I/O Controller validation
 
@@ -1051,6 +1114,8 @@ Measure:
 
 - logical block/DAT-bank transition to stable LS612 outputs
 - mapper output, including `PA20`, to valid RAM/ROM selects
+- external `FE_PAGE` / `FF_PAGE` predecode delay and margin before CPLD transfer qualification
+- discrete clock/MRDY behavior at the target CPU clock
 - `BA`/`BS` acknowledge transition to registered `DAT_BANK` and `SYS_MODE`
 - fixed-vector and first-trampoline fetch behavior around privilege entry
 - privileged return transition from fixed trampoline into working map
@@ -1072,6 +1137,7 @@ Measure:
 The following details are intentionally not yet frozen:
 
 - exact ATF15xx device and package; a real macrocell/product-term/pin budget is now required before schematic commitment
+- exact gate family/part implementation for the committed external `FE_PAGE` / `FF_PAGE` predecode
 - exact `MMU_CTRL` encoding for privileged DAT-bank selection, user return, and boot controls
 - exact registered-equation implementation of the `BA`/`BS` acknowledge entry gate
 - exact HD63C09E acknowledge timing and reset interaction after data-sheet validation
@@ -1084,9 +1150,10 @@ The following details are intentionally not yet frozen:
 - exact 1 MiB SRAM and 512 KiB ROM devices and organization
 - whether the reserved physical block range `80h-BFh` remains permanently unpopulated or is assigned in a future revision
 - LS612 versus a validated compatible HCT mapper
-- final 6309 clock and complete timing proof
+- final discrete 6309 clock-divider/MRDY implementation and complete timing proof
 - exact electrical mechanism used to suppress denied pBITz transfers
 - exact mechanism used to return the deterministic denied-read value
+- whether optional hardware fault/status readback is worth the CPLD data-output and mux cost
 - whether I/O-protection faults merely latch diagnostics or also request `FIRQ`
 - whether NitrOS-9 keeps one global `USER_IO_MASK` policy or saves/restores it per process
 - whether the Espresso EOU graphics port retains the reference CoCo convention of reserving NitrOS-9 software task 1 for GrfDrv
@@ -1095,7 +1162,7 @@ The following details are intentionally not yet frozen:
 - byte-level IOCALL command/reply/event/bulk-transfer protocol
 - final timer source for the NitrOS-9 system tick
 
-These items should be resolved by schematic, CPLD fitting, and firmware bring-up without changing the central architectural decisions: **1 MiB RAM plus 512 KiB ROM in a 2 MiB physical envelope; two native 8 KiB LS612 hardware DAT banks selected by `DAT_BANK`/`MA3`, with NitrOS-9 software task DAT images cached into the working bank as needed; an independent `SYS_MODE` privilege latch with one-way `BA`/`BS` hardware entry to the resident system map; a small fixed top-of-memory vector/trampoline area; a sixteen-bit unprivileged pBITz Device Select permission mask; and a W65C22S peripheral transport to the RX660 I/O Controller.**
+These items should be resolved by schematic, CPLD fitting, and firmware bring-up without changing the central architectural decisions: **1 MiB RAM plus 512 KiB ROM in a 2 MiB physical envelope; two native 8 KiB LS612 hardware DAT banks selected by `DAT_BANK`/`MA3`, with NitrOS-9 software task DAT images cached into the working bank as needed; an independent `SYS_MODE` privilege latch with one-way `BA`/`BS` hardware entry to the resident system map; externally predecoded fixed `FEh`/`FFh` pages; write-oriented, software-shadowed configuration state; discrete CPU clock/MRDY generation; a small fixed top-of-memory vector/trampoline area; a sixteen-bit unprivileged pBITz Device Select permission mask; and a W65C22S peripheral transport to the RX660 I/O Controller.**
 
 ## 21. References
 
